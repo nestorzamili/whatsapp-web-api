@@ -1,125 +1,78 @@
-import { Client, LocalAuth } from "whatsapp-web.js";
+import { Client } from "whatsapp-web.js";
 import { v4 as uuidv4 } from "uuid";
 import logger from "../config/logger";
 import fs from "fs/promises";
 import path from "path";
 import { ClientData, ClientStatus } from "../interfaces/whatsapp.interface";
-import qrcode from "qrcode-terminal";
-import { puppeteerConfig } from "../config/puppeteer.config";
+import { WHATSAPP_CONFIG } from "../config/whatsapp.config";
+import { ClientManager } from "./managers/client-manager";
+import { EventHandler } from "./managers/event-handler";
+import { CleanupManager } from "./managers/cleanup-manager";
 
 export class WhatsAppService {
-  private clients: Map<string, ClientData> = new Map();
-  private readonly SESSION_PATH = "./sessions";
-  private readonly IDLE_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+  private clientManager: ClientManager;
+  private eventHandler: EventHandler;
+  private cleanupManager: CleanupManager;
 
   constructor() {
-    this.startIdleCheck();
-  }
+    this.clientManager = new ClientManager();
+    this.eventHandler = new EventHandler(this.reconnectClient.bind(this));
+    this.cleanupManager = new CleanupManager(this.clientManager);
 
-  private createClient(clientId: string): Client {
-    return new Client({
-      authTimeoutMs: 20000,
-      takeoverOnConflict: true,
-      restartOnAuthFail: true,
-      authStrategy: new LocalAuth({
-        clientId,
-        dataPath: path.join(this.SESSION_PATH, clientId),
-      }),
-      puppeteer: puppeteerConfig,
-    });
+    this.startIdleCheck();
+    this.setupErrorHandlers();
   }
 
   private startIdleCheck() {
     setInterval(() => {
-      this.clients.forEach((data, clientId) => {
+      this.clientManager.getAllClients().forEach((data, clientId) => {
         const idleTime = Date.now() - data.lastActive.getTime();
         if (
-          idleTime >= this.IDLE_TIMEOUT &&
+          idleTime >= WHATSAPP_CONFIG.IDLE_TIMEOUT &&
           data.status === ClientStatus.CONNECTED
         ) {
           this.idleClient(clientId).catch(logger.error);
         }
       });
-    }, 60000);
+    }, WHATSAPP_CONFIG.IDLE_CHECK_INTERVAL);
   }
 
-  private async safeDestroy(clientId: string): Promise<void> {
-    const clientData = this.clients.get(clientId);
-    if (!clientData) return;
+  private setupErrorHandlers() {
+    const handleError = async (error: Error | string) => {
+      const errorMsg = error instanceof Error ? error.message : error;
+      if (
+        errorMsg.includes("Protocol Error:") ||
+        errorMsg.includes("Target closed.")
+      ) {
+        logger.error("Critical error detected:", errorMsg);
+        await this.cleanupManager.cleanupAllClients();
+      }
+    };
 
-    try {
-      await clientData.client.destroy();
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      const sessionPath = path.join(this.SESSION_PATH, clientId);
-      await fs.rmdir(sessionPath, { recursive: true });
-    } catch (error) {
-      logger.error(`Error in safeDestroy for client ${clientId}:`, error);
-      throw error;
-    }
+    process.on("unhandledRejection", handleError);
+    process.on("uncaughtException", handleError);
   }
 
   async initializeClient(): Promise<{ clientId: string; qr?: string }> {
     const clientId = uuidv4();
-    const client = this.createClient(clientId);
-
+    const client = this.clientManager.createClient(clientId);
     const clientData: ClientData = {
       client,
       status: ClientStatus.INITIALIZING,
       lastActive: new Date(),
     };
 
-    this.clients.set(clientId, clientData);
-
-    return new Promise((resolve, reject) => {
-      client.on("qr", (qr) => {
-        clientData.qr = qr;
-        clientData.status = ClientStatus.INITIALIZING;
-        qrcode.generate(qr, { small: true });
-        logger.info(`QR Code generated for client: ${clientId}`);
-        resolve({ clientId, qr });
-      });
-
-      client.on("ready", () => {
-        clientData.status = ClientStatus.CONNECTED;
-        clientData.lastActive = new Date();
-        delete clientData.qr;
-        logger.info(`Client ${clientId} is ready`);
-      });
-
-      client.on("auth_failure", (error) => {
-        clientData.status = ClientStatus.ERROR;
-        clientData.error = error;
-        logger.error(`Client ${clientId} authentication failure:`, error);
-        reject(error);
-      });
-
-      client.on("loading_screen", (percent, message) => {
-        logger.info(`Client ${clientId} loading: ${percent}% - ${message}`);
-      });
-
-      client.on("disconnected", async (reason) => {
-        clientData.status = ClientStatus.DISCONNECTED;
-        clientData.error = reason;
-        logger.warn(`Client ${clientId} disconnected:`, reason);
-
-        try {
-          await this.safeDestroy(clientId);
-          logger.info(`Client ${clientId} cleaned up after disconnect`);
-        } catch (error) {
-          logger.error(
-            `Error handling disconnect for client ${clientId}:`,
-            error
-          );
-        }
-      });
-
-      client.initialize().catch(reject);
-    });
+    this.clientManager.setClient(clientId, clientData);
+    return this.eventHandler.setupClientEvents(
+      client,
+      clientId,
+      clientData,
+      this.cleanupManager.cleanupClient.bind(this.cleanupManager)
+    );
   }
 
   async reconnectClient(clientId: string): Promise<boolean> {
-    const sessionPath = path.join(this.SESSION_PATH, clientId);
+    const sessionPath = path.join(WHATSAPP_CONFIG.SESSION_PATH, clientId);
     const sessionExists = await fs
       .access(sessionPath)
       .then(() => true)
@@ -130,20 +83,19 @@ export class WhatsAppService {
       return false;
     }
 
-    const clientData = this.clients.get(clientId);
-    if (clientData) {
+    if (this.clientManager.getClientData(clientId)) {
       logger.info(`Client ${clientId} is already connected`);
       return false;
     }
 
-    const client = this.createClient(clientId);
+    const client = this.clientManager.createClient(clientId);
     const newClientData: ClientData = {
       client,
       status: ClientStatus.INITIALIZING,
       lastActive: new Date(),
     };
 
-    this.clients.set(clientId, newClientData);
+    this.clientManager.setClient(clientId, newClientData);
 
     try {
       await client.initialize();
@@ -151,22 +103,23 @@ export class WhatsAppService {
       return true;
     } catch (error) {
       logger.error(`Failed to initialize client ${clientId}:`, error);
-      this.clients.delete(clientId);
+      this.clientManager.deleteClient(clientId);
       throw error;
     }
   }
 
+  // Public methods
   async idleClient(clientId: string): Promise<void> {
-    const clientData = this.clients.get(clientId);
+    const clientData = this.clientManager.getClientData(clientId);
     if (clientData) {
       clientData.status = ClientStatus.IDLE;
       await clientData.client.destroy();
-      this.clients.delete(clientId);
+      this.clientManager.deleteClient(clientId);
     }
   }
 
   async logoutClient(clientId: string): Promise<void> {
-    const clientData = this.clients.get(clientId);
+    const clientData = this.clientManager.getClientData(clientId);
     if (clientData) {
       try {
         await clientData.client.logout().catch((err) => {
@@ -175,45 +128,28 @@ export class WhatsAppService {
             err
           );
         });
-
-        await this.safeDestroy(clientId);
-        this.clients.delete(clientId);
+        await this.cleanupManager.cleanupClient(clientId);
         logger.info(
           `Client ${clientId} logged out and cleaned up successfully`
         );
       } catch (error) {
         logger.error(`Error during logout for client ${clientId}:`, error);
-        this.clients.delete(clientId);
+        this.clientManager.deleteClient(clientId);
         throw error;
       }
     }
   }
 
   getClientStatus(clientId: string) {
-    const clientData = this.clients.get(clientId);
-    return clientData
-      ? {
-          clientId,
-          status: clientData.status,
-          lastActive: clientData.lastActive,
-          qr: clientData.qr,
-        }
-      : null;
+    return this.clientManager.getClientStatus(clientId);
   }
 
   updateClientActivity(clientId: string) {
-    const clientData = this.clients.get(clientId);
-    if (clientData) {
-      clientData.lastActive = new Date();
-    }
+    this.clientManager.updateClientActivity(clientId);
   }
 
-  getClient(clientId: string) {
-    const clientData = this.clients.get(clientId);
-    if (!clientData) {
-      throw new Error("Client not found");
-    }
-    return clientData.client;
+  getClient(clientId: string): Client {
+    return this.clientManager.getClient(clientId);
   }
 }
 
