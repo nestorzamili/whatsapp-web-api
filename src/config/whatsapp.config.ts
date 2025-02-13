@@ -3,4 +3,10 @@ export const WHATSAPP_CONFIG = {
   IDLE_TIMEOUT: 24 * 60 * 60 * 1000, // 24 hours
   AUTH_TIMEOUT: 20000,
   IDLE_CHECK_INTERVAL: 60000, // 1 minute
+  RATE_LIMIT: {
+    MAX_MESSAGES_PER_MINUTE: 30,
+    MAX_MESSAGES_PER_HOUR: 500,
+    MAX_MESSAGES_PER_DAY: 5000,
+    WINDOW_MS: 60000, // 1 minute window
+  },
 };

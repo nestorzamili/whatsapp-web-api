@@ -3,6 +3,7 @@ import { whatsappService } from "./whatsapp.service";
 import logger from "../config/logger";
 import { BatchProcessResult } from "../interfaces/message.interface";
 import { NumberChecker } from "./helpers/number-checker";
+import { rateLimiter } from "./helpers/rate-limiter";
 
 export class BulkMessageService {
   private readonly BATCH_SIZE = 20;
@@ -15,6 +16,19 @@ export class BulkMessageService {
 
   private formatNumber(number: string): string {
     return number.includes("@c.us") ? number : `${number}@c.us`;
+  }
+
+  private async sendWithRateLimit(
+    client: any,
+    number: string,
+    message: string | MessageMedia,
+    options?: any
+  ): Promise<void> {
+    const clientId = client.options.authStrategy.clientId;
+    await rateLimiter.waitForAvailableSlot(clientId);
+
+    await client.sendMessage(number, message, options);
+    await rateLimiter.incrementCounter(clientId);
   }
 
   private async processBatch(
@@ -40,19 +54,33 @@ export class BulkMessageService {
 
         if (imageUrl) {
           const media = await MessageMedia.fromUrl(imageUrl);
-          await client.sendMessage(formattedNumber, media, { caption });
+          await this.sendWithRateLimit(client, formattedNumber, media, {
+            caption,
+          });
         } else {
-          await client.sendMessage(formattedNumber, message);
+          await this.sendWithRateLimit(client, formattedNumber, message);
         }
 
         result.success.push(number);
         await this.delay(this.DELAY_BETWEEN_MESSAGES);
-      } catch (error) {
-        result.failed.push({
-          number,
-          error: error instanceof Error ? error.message : "Unknown error",
-        });
-        logger.error(`Failed to send message to ${number}:`, error);
+      } catch (error: unknown) {
+        if (
+          error instanceof Error &&
+          error.message === "Rate limit timeout exceeded"
+        ) {
+          logger.warn(`Rate limit exceeded for batch, pausing for recovery...`);
+          await this.delay(this.DELAY_BETWEEN_BATCHES * 2); // Extended delay for rate limit recovery
+          result.failed.push({
+            number,
+            error: "Rate limit exceeded, message will be retried later",
+          });
+        } else {
+          result.failed.push({
+            number,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          logger.error(`Failed to send message to ${number}:`, error);
+        }
       }
     }
 
