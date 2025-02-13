@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import { MessageMedia } from "whatsapp-web.js";
 import { whatsappService } from "../services/whatsapp.service";
 import logger from "../config/logger";
+import { bulkMessageService } from "../services/bulk-message.service";
+import { NumberChecker } from "../services/helpers/number-checker";
 
 export const sendTextMessage = async (
   req: Request,
@@ -73,5 +75,81 @@ export const sendImageMessage = async (
   } catch (error) {
     logger.error("Error sending image message:", error);
     res.status(500).json({ message: "Failed to send image message", error });
+  }
+};
+
+export const sendBulkMessages = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { numbers, message, clientId, imageUrl, caption } = req.body;
+
+    const clientData = whatsappService.getClientStatus(clientId);
+    if (!clientData) {
+      res.status(404).json({ message: "Client not found" });
+      return;
+    }
+
+    const result = await bulkMessageService.sendBulkMessages(
+      numbers,
+      message,
+      clientId,
+      imageUrl,
+      caption
+    );
+
+    logger.info(
+      `Bulk message processing completed for client ${clientId}. ` +
+        `Success: ${result.success.length}, Failed: ${result.failed.length}`
+    );
+
+    res.json({
+      message: "Bulk message processing completed",
+      result,
+    });
+  } catch (error) {
+    logger.error("Error processing bulk messages:", error);
+    res.status(500).json({
+      message: "Failed to process bulk messages",
+      error,
+    });
+  }
+};
+
+export const checkNumbers = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { numbers, clientId } = req.body;
+
+    if (!numbers || !clientId || !Array.isArray(numbers)) {
+      res.status(400).json({
+        message: "Numbers array and clientId are required",
+      });
+      return;
+    }
+
+    const clientData = whatsappService.getClientStatus(clientId);
+    if (!clientData) {
+      res.status(404).json({ message: "Client not found" });
+      return;
+    }
+
+    const client = whatsappService.getClient(clientId);
+    const result = await NumberChecker.checkNumbers(client, numbers);
+
+    whatsappService.updateClientActivity(clientId);
+    res.json({
+      message: "Number check completed",
+      result,
+    });
+  } catch (error) {
+    logger.error("Error checking numbers:", error);
+    res.status(500).json({
+      message: "Failed to check numbers",
+      error,
+    });
   }
 };
